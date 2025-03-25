@@ -1,0 +1,4 @@
+opencv-python==4.8.1.78
+numpy==1.26.2
+ultralytics==8.0.227
+pillow==10.1.0 
