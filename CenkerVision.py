@@ -17,6 +17,13 @@ from ultralytics import YOLO
 import threading
 import time
 import queue
+import torch  # torch kütüphanesini import ediyoruz
+
+# Sabit değişkenler
+DEBUG_MODE = True # Hata ayıklama modu
+SIMPLE_MODE = True # Basit mod - YOLO işlemini atlar sadece videoyu gösterir
+FORCE_CPU = False # M1 Mac'in GPU/MPS desteğini etkinleştir
+MAX_FRAME_RATE = 100 # Maksimum FPS değeri - CPU kullanımını optimize etmek için
 
 class CenkerVision:
     def __init__(self, root):
@@ -43,11 +50,41 @@ class CenkerVision:
         self.processing = False  # İşleme durumu
         self.seek_lock = threading.Lock()  # Video karelerini güvenli şekilde sıçratmak için kilit
         
+        # Debug modu
+        self.debug_mode = DEBUG_MODE
+        self.simple_mode = SIMPLE_MODE
+        self.force_cpu = FORCE_CPU
+        
+        # Başlık güncelleme
+        mode_info = []
+        if self.simple_mode:
+            mode_info.append("BASİT MOD")
+        if self.debug_mode:
+            mode_info.append("HATA AYIKLAMA")
+        if self.force_cpu:
+            mode_info.append("CPU MODU")
+        
+        if mode_info:
+            self.root.title(f"CenkerVision - YOLO Tabanlı Video Oynatıcı [{', '.join(mode_info)}]")
+        
+        # Cihaz seçimi (CPU veya MPS/GPU)
+        self.device = self.get_device()
+        print(f"Kullanılacak cihaz: {self.device}")
+        
         # FPS sayacı için değişkenler
         self.fps = 0
         self.frame_times = []
         self.fps_update_interval = 1.0  # FPS güncelleme aralığı (saniye)
         self.last_fps_update = time.time()
+        
+        # Basit mod UI kontrolü
+        if self.simple_mode:
+            print("BASİT MOD ETKİN: YOLO işlemi atlanacak ve sadece video gösterilecek")
+        
+        # M1/Metal kullanım bilgisi
+        if not self.force_cpu and self.device == "mps":
+            print("⚡ M1/M2 Metal Performance Shaders (MPS) etkin - GPU hızlandırma kullanılıyor")
+            print("   MPS destekli PyTorch sürümü:", torch.__version__)
         
         # Özel modelleri saklamak için dizini kontrol et ve oluştur
         self.models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
@@ -214,10 +251,17 @@ class CenkerVision:
         try:
             if not self.frame_queue.empty():
                 frame, current_frame = self.frame_queue.get_nowait()
-                self.update_ui(frame, current_frame)
+                
+                if frame is not None and len(frame.shape) == 3:  # Geçerli bir frame mi?
+                    self.update_ui(frame, current_frame)
+                else:
+                    print("Geçersiz frame alındı, atlanıyor")
+                
                 self.frame_queue.task_done()
         except queue.Empty:
             pass
+        except Exception as e:
+            print(f"Queue işleme hatası: {str(e)}")
         finally:
             # 10ms sonra tekrar kontrol et
             self.root.after(10, self.check_queue)
@@ -311,12 +355,39 @@ class CenkerVision:
         """Görüntüleme modunu güncelle"""
         self.display_mode = self.display_mode_var.get()
     
+    def get_device(self):
+        """Kullanılacak cihazı belirle (MPS, CUDA veya CPU)"""
+        if self.force_cpu:
+            print("CPU kullanımı manuel olarak zorlandı.")
+            return "cpu"
+            
+        if torch.backends.mps.is_available():
+            try:
+                # MPS kullanılabilirliğini daha detaylı kontrol et
+                test_tensor = torch.zeros(1).to("mps")
+                device = "mps"
+                print("Apple Silicon MPS (Metal Performance Shaders) kullanılıyor")
+                print("MPS cihazı hazır:", torch.backends.mps.is_built())
+                return "mps"
+            except Exception as e:
+                print(f"MPS kullanılabilir ancak bir hata oluştu: {e}")
+                print("CPU'ya düşüyor...")
+                return "cpu"
+        elif torch.cuda.is_available():
+            device = "cuda"
+            print("NVIDIA CUDA GPU kullanılıyor")
+            return "cuda"
+        else:
+            device = "cpu"
+            print("CPU kullanılıyor")
+            return "cpu"
+    
     def load_yolo_model(self, model_name):
         """YOLO modelini yükle"""
         try:
             # status_label kullanılabilirliğini kontrol et
             if hasattr(self, 'status_label'):
-                self.status_label.config(text="Model yükleniyor: {}".format(model_name))
+                self.status_label.config(text=f"Model yükleniyor: {model_name} ({self.device})")
                 self.root.update()  # UI'yi hemen güncelle
             
             # Özel model yolunu kontrol et
@@ -326,13 +397,25 @@ class CenkerVision:
             else:
                 self.model = YOLO(model_name)
                 
-            print("{} modeli başarıyla yüklendi.".format(model_name))
+            # Modeli seçilen cihaza taşı
+            if self.device != "cpu":
+                try:
+                    print(f"Model {self.device} cihazına taşınıyor...")
+                    self.model.to(self.device)
+                    # Model başarıyla GPU'ya taşındı
+                    print(f"Model başarıyla {self.device} cihazına taşındı!")
+                except Exception as e:
+                    print(f"Model {self.device} cihazına taşınırken hata: {e}")
+                    print("Güvenli mod: Model CPU'da kalacak")
+                    self.device = "cpu" # Cihazı CPU'ya çevir
+                
+            print(f"{model_name} modeli başarıyla yüklendi. (Cihaz: {self.device})")
             
             if hasattr(self, 'status_label'):
-                self.status_label.config(text="{} modeli başarıyla yüklendi.".format(model_name))
+                self.status_label.config(text=f"{model_name} modeli başarıyla yüklendi. (Cihaz: {self.device})")
                 
         except Exception as e:
-            error_msg = "Model yüklenirken hata oluştu: {}".format(e)
+            error_msg = f"Model yüklenirken hata oluştu: {e}"
             print(error_msg)
             messagebox.showerror("Model Hatası", error_msg)
             self.model = None
@@ -420,179 +503,316 @@ class CenkerVision:
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         frame_time = 1.0 / fps if fps > 0 else 0.033  # Varsayılan ~30fps
         
+        # Maksimum frame rate ile sınırlandır
+        if MAX_FRAME_RATE > 0 and fps > MAX_FRAME_RATE:
+            target_frame_time = 1.0 / MAX_FRAME_RATE
+            print(f"FPS {fps} -> {MAX_FRAME_RATE} olarak sınırlandırıldı (performans optimizasyonu)")
+        else:
+            target_frame_time = frame_time
+            
+        frame_counter = 0  # Hata ayıklama için sayaç
+        last_debug_time = time.time()  # Hata ayıklama için zaman
+        
         while self.is_playing and not self.stop_thread:
             start_time = time.time()
+            frame_counter += 1
             
-            # Kilit kullanarak güvenli okuma
-            with self.seek_lock:
-                ret, frame = self.cap.read()
-                if not ret:
-                    # Video sonuna gelindi, başa sar
-                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    self.current_frame = 0
-                    self.root.after(0, self.update_ui_stopped)
-                    break
-                
-                self.current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            # Periyodik hata ayıklama çıktısı
+            if self.debug_mode and (time.time() - last_debug_time > 2.0):  # Her 2 saniyede bir
+                print(f"Debug: Frame sayacı = {frame_counter}, FPS = {self.fps:.1f}")
+                last_debug_time = time.time()
+                frame_counter = 0  # Sayacı sıfırla
             
-            # Frame'i işle ve queue'ya ekle
             try:
-                # İşlenmiş frame'i queue'ya ekle
-                if not self.processing:
-                    self.processing = True
-                    processed_frame = self.process_frame(frame)
-                    self.frame_queue.put((processed_frame, self.current_frame), block=False)
-                    self.processing = False
-            except queue.Full:
-                # Queue dolu, önceki frame'leri atla
-                pass
-            
-            # FPS hesaplama
-            frame_time = time.time() - start_time
-            self.frame_times.append(frame_time)
-            
-            # Her 30 frame'de bir veya 1 saniyede bir FPS'i güncelle
-            current_time = time.time()
-            if len(self.frame_times) >= 30 or (current_time - self.last_fps_update) >= self.fps_update_interval:
-                avg_frame_time = sum(self.frame_times) / len(self.frame_times)
-                self.fps = 1.0 / avg_frame_time
-                self.frame_times = []
-                self.last_fps_update = current_time
-            
-            # Slider konumunu güncelle (UI thread'indeki düşük öncelikli işlem)
-            self.root.after_idle(lambda cf=self.current_frame: self.progress_slider.set(cf))
-            
-            # İlerleme bilgisini güncelle
-            if self.current_frame % 10 == 0:  # Her 10 karede bir güncelle
-                current_time = self.current_frame / fps
-                status_text = "Oynatılıyor: {}/{} ({}) - FPS: {:.1f}".format(
-                    self.format_time(current_time),
-                    self.format_time(self.frame_count / fps),
-                    self.current_frame,
-                    self.fps
-                )
-                self.root.after_idle(lambda t=status_text: self.status_label.config(text=t))
-            
-            # FPS kontrolü
-            elapsed = time.time() - start_time
-            sleep_time = max(0.001, frame_time - elapsed)
-            time.sleep(sleep_time)
+                # Kilit kullanarak güvenli okuma
+                with self.seek_lock:
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        # Video sonuna gelindi, başa sar
+                        print("Video sonuna gelindi, başa sarılıyor...")
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        self.current_frame = 0
+                        self.root.after(0, self.update_ui_stopped)
+                        break
+                    
+                    self.current_frame = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                
+                # Basit modda direkt frame'i queue'ya ekle (YOLO işlemesini atla)
+                if self.simple_mode:
+                    self.frame_queue.put((frame, self.current_frame), block=False)
+                else:
+                    # Frame'i işle ve queue'ya ekle
+                    try:
+                        # İşlenmiş frame'i queue'ya ekle
+                        if not self.processing:
+                            self.processing = True
+                            processed_frame = self.process_frame(frame)
+                            self.frame_queue.put((processed_frame, self.current_frame), block=False)
+                            self.processing = False
+                    except queue.Full:
+                        # Queue dolu, önceki frame'leri atla
+                        pass
+                    except Exception as e:
+                        if str(e):  # Sadece boş olmayan hataları yazdır
+                            print(f"Frame işleme hatası: {str(e)}")
+                        # Hata durumunda işlenmemiş frame'i kullan
+                        self.frame_queue.put((frame, self.current_frame), block=False)
+                        self.processing = False
+                
+                # FPS hesaplama
+                frame_time = time.time() - start_time
+                self.frame_times.append(frame_time)
+                
+                # Her 30 frame'de bir veya 1 saniyede bir FPS'i güncelle
+                current_time = time.time()
+                if len(self.frame_times) >= 30 or (current_time - self.last_fps_update) >= self.fps_update_interval:
+                    if self.frame_times:  # Boş liste kontrolü
+                        avg_frame_time = sum(self.frame_times) / len(self.frame_times)
+                        self.fps = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+                    self.frame_times = []
+                    self.last_fps_update = current_time
+                
+                # Slider konumunu güncelle (UI thread'indeki düşük öncelikli işlem)
+                self.root.after_idle(lambda cf=self.current_frame: self.progress_slider.set(cf))
+                
+                # İlerleme bilgisini güncelle
+                if self.current_frame % 10 == 0:  # Her 10 karede bir güncelle
+                    current_time = self.current_frame / fps
+                    mode_text = "[BASİT MOD]" if self.simple_mode else ""
+                    status_text = f"Oynatılıyor: {self.format_time(current_time)}/{self.format_time(self.frame_count / fps)} ({self.current_frame}) - FPS: {self.fps:.1f} {mode_text}"
+                    self.root.after_idle(lambda t=status_text: self.status_label.config(text=t))
+                
+                # Kare hızını kontrol et ve sınırlandır (CPU kullanımını azaltmak için)
+                elapsed = time.time() - start_time
+                sleep_time = max(0.001, target_frame_time - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                
+            except Exception as e:
+                if str(e):  # Sadece boş olmayan hataları yazdır
+                    print(f"Video oynatma hatası: {str(e)}")
+                # Hata durumunda kısa bir süre bekleyip devam et
+                time.sleep(0.1)
     
     def process_frame(self, frame):
         """Frame işleme"""
         # İşlenmemiş kareyi sakla, threshold değiştiğinde kullanmak için
-        self.current_processed_frame = frame.copy()
-        
-        if self.detect_var.get() and self.model is not None:
-            # Eşik değerleri kullanım bilgisini yazdır
-            print(f"YOLO çalıştırılıyor - Model: {self.model_var.get()}, Conf: {self.conf_threshold:.2f}, IOU: {self.iou_threshold:.2f}")
-            
-            # YOLO ile nesne tespiti
-            results = self.model(frame, conf=self.conf_threshold, iou=self.iou_threshold)
-            
-            # Algılanan nesne sayısını yazdır
-            box_count = len(results[0].boxes)
-            print(f"Algılanan nesne sayısı: {box_count}")
-            
-            # Görüntüleme moduna göre işlem yap
-            if self.display_mode == "normal":
-                # Varsayılan görüntüleme - hem kutular hem class isimleri hem de conf değerleri
-                annotated_frame = results[0].plot()
-                display_frame = annotated_frame
-            
-            elif self.display_mode == "boxes_only":
-                # Sadece kutuları göster, isimleri ve conf değerlerini gösterme
-                annotated_frame = frame.copy()
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                
-                for box in boxes:
-                    x1, y1, x2, y2 = box.astype(int)
-                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                display_frame = annotated_frame
-            
-            elif self.display_mode == "confidence":
-                # Sadece kutuları ve conf değerlerini göster
-                annotated_frame = frame.copy()
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                conf_values = results[0].boxes.conf.cpu().numpy()
-                
-                for i, box in enumerate(boxes):
-                    x1, y1, x2, y2 = box.astype(int)
-                    conf = conf_values[i]
+        try:
+            original_frame_for_display = frame.copy() # Görüntüleme için orijinal kareyi sakla
+            self.current_processed_frame = frame.copy() # Yeniden işleme için orijinal kareyi sakla
+
+            if self.detect_var.get() and self.model is not None:
+                try:
+                    # Hata ayıklama için
+                    if self.debug_mode:
+                        print(f"Frame boyutu: {frame.shape}")
                     
-                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(annotated_frame, "{:.2f}".format(conf), (x1, y1-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    # Kareyi 720p'ye yeniden boyutlandır (yüksek çözünürlüklü videolar için performans artışı)
+                    h, w = frame.shape[:2]
+                    target_h = 720
+                    if h > target_h:
+                        ratio = target_h / h
+                        target_w = int(w * ratio)
+                        # Hız için INTER_LINEAR kullan
+                        resized_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                        if self.debug_mode:
+                            print(f"Frame boyutlandırıldı: {w}x{h} -> {target_w}x{target_h}")
+                        # Boyutlandırılmış kareyi kullan
+                        process_frame = resized_frame
+                    else:
+                        # Zaten küçük boyuttaysa orijinal kareyi kullan
+                        process_frame = frame
+                    
+                    # MPS ile ilgili hataları yakalamak için önce CPU'da deneyelim
+                    if self.debug_mode:
+                        print(f"İşlem öncesi model cihazı: {self.device}")
+                    
+                    # Güvenli mod - herhangi bir hata durumunda CPU'ya geçiş yap
+                    try:
+                        # Eşik değerleri kullanım bilgisini yazdır
+                        if self.debug_mode:
+                            print(f"YOLO çalıştırılıyor - Model: {self.model_var.get()}, Conf: {self.conf_threshold:.2f}, IOU: {self.iou_threshold:.2f}, Cihaz: {self.device}")
+                        
+                        # YOLO ile nesne tespiti
+                        t_start = time.time()
+                        results = self.model(process_frame, conf=self.conf_threshold, iou=self.iou_threshold)
+                        inference_time = time.time() - t_start
+                        
+                        if self.debug_mode:
+                            print(f"YOLO çıkarım süresi: {inference_time*1000:.1f} ms")
+                        
+                        # Algılanan nesne sayısını yazdır
+                        box_count = len(results[0].boxes)
+                        if self.debug_mode:
+                            print(f"Algılanan nesne sayısı: {box_count}")
+                        
+                        # Görüntüleme moduna göre işlem yap
+                        if self.display_mode == "normal":
+                            # Varsayılan görüntüleme - hem kutular hem class isimleri hem de conf değerleri
+                            annotated_frame = results[0].plot()
+                            display_frame = annotated_frame
+                        
+                        elif self.display_mode == "boxes_only":
+                            # Sadece kutuları göster, isimleri ve conf değerlerini gösterme
+                            annotated_frame = frame.copy()
+                            boxes = results[0].boxes.xyxy.cpu().numpy()
+                            
+                            for box in boxes:
+                                x1, y1, x2, y2 = box.astype(int)
+                                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            
+                            display_frame = annotated_frame
+                        
+                        elif self.display_mode == "confidence":
+                            # Sadece kutuları ve conf değerlerini göster
+                            annotated_frame = frame.copy()
+                            boxes = results[0].boxes.xyxy.cpu().numpy()
+                            conf_values = results[0].boxes.conf.cpu().numpy()
+                            
+                            for i, box in enumerate(boxes):
+                                x1, y1, x2, y2 = box.astype(int)
+                                conf = conf_values[i]
+                                
+                                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                cv2.putText(annotated_frame, "{:.2f}".format(conf), (x1, y1-10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            
+                            display_frame = annotated_frame
+                        
+                        elif self.display_mode == "censored":
+                            # Tespit edilen nesneleri sansürle/bulanıklaştır
+                            annotated_frame = frame.copy()
+                            boxes = results[0].boxes.xyxy.cpu().numpy()
+                            
+                            for box in boxes:
+                                x1, y1, x2, y2 = box.astype(int)
+                                # Tespit edilen bölgeyi bulanıklaştır
+                                roi = annotated_frame[y1:y2, x1:x2]
+                                if roi.size > 0:  # ROI'nin boş olmadığından emin ol
+                                    blurred_roi = cv2.GaussianBlur(roi, (51, 51), 0)
+                                    annotated_frame[y1:y2, x1:x2] = blurred_roi
+                            
+                            display_frame = annotated_frame
+                        
+                        else:
+                            # Bilinmeyen mod, varsayılan görüntülemeyi kullan
+                            display_frame = results[0].plot()
+                            
+                    except Exception as e:
+                        if str(e):  # Boş hata mesajlarını gösterme
+                            print(f"MPS/GPU'da işleme hatası: {str(e)}")
+                        print("CPU'ya geçiliyor...")
+                        old_device = self.device
+                        self.device = "cpu"
+                        
+                        # Model cihazını yeniden ayarla
+                        try:
+                            self.model.to("cpu")
+                        except:
+                            # to() metodu çalışmazsa, modeli yeniden yükle
+                            print("Model cihaz değişimi başarısız, yeniden yükleniyor...")
+                            self.load_yolo_model(self.model_var.get())
+                        
+                        # CPU'da tekrar dene
+                        results = self.model(process_frame, conf=self.conf_threshold, iou=self.iou_threshold)
+                        display_frame = results[0].plot()
+                        
+                        # Cihazı geri yükle (bir dahaki sefere önceki cihazla tekrar denenecek)
+                        self.device = old_device
+                        if old_device != "cpu":
+                            try:
+                                self.model.to(old_device)
+                                print(f"{old_device} cihazına geri dönüş başarılı")
+                            except:
+                                print(f"{old_device} cihazına geri dönüş başarısız.")
                 
-                display_frame = annotated_frame
-            
-            elif self.display_mode == "censored":
-                # Tespit edilen nesneleri sansürle/bulanıklaştır
-                annotated_frame = frame.copy()
-                boxes = results[0].boxes.xyxy.cpu().numpy()
-                
-                for box in boxes:
-                    x1, y1, x2, y2 = box.astype(int)
-                    # Tespit edilen bölgeyi bulanıklaştır
-                    roi = annotated_frame[y1:y2, x1:x2]
-                    if roi.size > 0:  # ROI'nin boş olmadığından emin ol
-                        blurred_roi = cv2.GaussianBlur(roi, (51, 51), 0)
-                        annotated_frame[y1:y2, x1:x2] = blurred_roi
-                
-                display_frame = annotated_frame
-            
+                except Exception as e:
+                    if str(e):  # Boş hata mesajlarını gösterme
+                        print(f"Genel bir hata oluştu: {str(e)}")
+                    # Hata durumunda orijinal görüntüyü göster
+                    display_frame = frame
+                    # Eğer sürekli hata alınıyorsa nesne tespitini kapat
+                    if hasattr(self, 'detect_var'):
+                        print("Nesne tespiti geçici olarak devre dışı bırakılıyor...")
+                        self.detect_var.set(False)
             else:
-                # Bilinmeyen mod, varsayılan görüntülemeyi kullan
-                display_frame = results[0].plot()
-        else:
-            display_frame = frame
+                display_frame = frame
+                
+            return display_frame
             
-        return display_frame
+        except Exception as e:
+            # En son çare - herhangi bir hata durumunda orijinal frame'i döndür
+            print(f"Process frame'de kritik hata: {str(e)}")
+            return frame
     
     def update_ui(self, frame, current_frame):
         """UI elemanlarını güncelle"""
-        # OpenCV BGR formatını RGB'ye çevir
-        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Canvas boyutunu al
-        canvas_width = self.canvas.winfo_width()
-        canvas_height = self.canvas.winfo_height()
-        
-        # Görüntü boyutlarını al
-        h, w, _ = rgb_image.shape
-        
-        # En-boy oranını koruyarak yeniden boyutlandır
-        ratio = min(canvas_width/w, canvas_height/h)
-        new_width = int(w * ratio)
-        new_height = int(h * ratio)
-        
-        # Yeniden boyutlandır
-        resized = cv2.resize(rgb_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
-        
-        # PIL Image'e çevir
-        pil_img = Image.fromarray(resized)
-        
-        # PhotoImage oluştur
-        self.photo = ImageTk.PhotoImage(image=pil_img)
-        
-        # Canvas'ı temizle
-        self.canvas.delete("all")
-        
-        # FPS göstergesini ekle
-        fps_text = f"FPS: {self.fps:.1f}"
-        self.canvas.create_text(10, 10, text=fps_text, fill="white", 
-                              font=('Arial', 12, 'bold'), anchor=tk.NW)
-        
-        # Görüntüyü canvas'a yerleştir (ortalanmış)
-        x_position = (canvas_width - new_width) // 2
-        y_position = (canvas_height - new_height) // 2
-        self.canvas.create_image(x_position, y_position, anchor=tk.NW, image=self.photo)
-        
-        # Zaman etiketini güncelle
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        current_time = current_frame / fps
-        self.time_label_start.config(text=self.format_time(current_time))
+        try:
+            # Null kontrol
+            if frame is None:
+                print("Boş frame, UI güncelleme atlanıyor")
+                return
+                
+            # Boyut kontrolü
+            if len(frame.shape) != 3:
+                print(f"Geçersiz frame boyutu: {frame.shape}")
+                return
+                
+            # OpenCV BGR formatını RGB'ye çevir
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Canvas boyutunu al
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            
+            # Geçerli canvas boyutu kontrolü
+            if canvas_width <= 1 or canvas_height <= 1:
+                # Canvas henüz hazır değil, atla
+                return
+            
+            # Görüntü boyutlarını al
+            h, w, _ = rgb_image.shape
+            
+            # En-boy oranını koruyarak yeniden boyutlandır
+            ratio = min(canvas_width/w, canvas_height/h)
+            new_width = int(w * ratio)
+            new_height = int(h * ratio)
+            
+            # Yeniden boyutlandır
+            resized = cv2.resize(rgb_image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
+            # PIL Image'e çevir
+            pil_img = Image.fromarray(resized)
+            
+            # PhotoImage oluştur
+            self.photo = ImageTk.PhotoImage(image=pil_img)
+            
+            # Canvas'ı temizle
+            self.canvas.delete("all")
+            
+            # FPS göstergesini ekle
+            fps_text = f"FPS: {self.fps:.1f}"
+            if self.simple_mode:
+                fps_text += " [BASİT MOD]"
+            if self.force_cpu:
+                fps_text += " [CPU]"
+                
+            self.canvas.create_text(10, 10, text=fps_text, fill="white", 
+                                font=('Arial', 12, 'bold'), anchor=tk.NW)
+            
+            # Görüntüyü canvas'a yerleştir (ortalanmış)
+            x_position = (canvas_width - new_width) // 2
+            y_position = (canvas_height - new_height) // 2
+            self.canvas.create_image(x_position, y_position, anchor=tk.NW, image=self.photo)
+            
+            # Zaman etiketini güncelle
+            if self.cap is not None:
+                fps = self.cap.get(cv2.CAP_PROP_FPS)
+                current_time = current_frame / fps
+                self.time_label_start.config(text=self.format_time(current_time))
+                
+        except Exception as e:
+            print(f"UI güncelleme hatası: {str(e)}")
     
     def update_ui_stopped(self):
         """Video durduğunda UI güncellemeleri"""
@@ -612,17 +832,88 @@ class CenkerVision:
     
     def display_frame(self, frame):
         """Tek bir frame gösterme (oynatma dışındaki durumlar için)"""
-        processed_frame = self.process_frame(frame)
-        self.update_ui(processed_frame, self.current_frame)
+        if self.simple_mode:
+            # Basit modda, direkt frame'i göster
+            self.update_ui(frame, self.current_frame)
+        else:
+            processed_frame = self.process_frame(frame)
+            self.update_ui(processed_frame, self.current_frame)
         
         # Eşik değerlerini durum çubuğunda göster
-        if self.detect_var.get() and self.model is not None:
+        if self.detect_var.get() and self.model is not None and not self.simple_mode:
             self.status_label.config(text=f"Confidence: {self.conf_threshold:.2f}, IOU: {self.iou_threshold:.2f}")
     
     def toggle_detection(self):
         """Nesne tespitini açıp kapama"""
-        if self.detect_var.get() and self.model is None:
-            self.load_yolo_model(self.model_var.get())
+        if self.detect_var.get():
+            if self.simple_mode:
+                # Basit moddan çıkıp nesne tespitini aç
+                print("Basit moddan nesne tespiti moduna geçiliyor...")
+                self.simple_mode = False
+                # Başlık güncelleme
+                self.update_title()
+            
+            if self.model is None:
+                self.load_yolo_model(self.model_var.get())
+        else:
+            # Nesne tespiti kapalı - basit mod otomatik devreye girmez
+            print("Nesne tespiti kapatıldı")
+    
+    def update_title(self):
+        """Pencere başlığını güncelle"""
+        mode_info = []
+        if self.simple_mode:
+            mode_info.append("BASİT MOD")
+        if self.debug_mode:
+            mode_info.append("HATA AYIKLAMA")
+        if self.force_cpu:
+            mode_info.append("CPU MODU")
+        
+        if mode_info:
+            self.root.title(f"CenkerVision - YOLO Tabanlı Video Oynatıcı [{', '.join(mode_info)}]")
+        else:
+            self.root.title("CenkerVision - YOLO Tabanlı Video Oynatıcı")
+    
+    # Yeni buton ekle - basit mod ve tam mod arası geçiş için
+    def add_simple_mode_button(self):
+        """Basit mod butonu ekle"""
+        # Bu metodu __init__ içinde çağırabilirsiniz
+        self.simple_mode_var = tk.BooleanVar(value=self.simple_mode)
+        self.simple_mode_checkbox = ttk.Checkbutton(
+            self.video_frame, 
+            text="Basit Mod (Sadece Video)", 
+            variable=self.simple_mode_var,
+            command=self.toggle_simple_mode
+        )
+        self.simple_mode_checkbox.pack(side=tk.TOP, padx=5, pady=5)
+    
+    def toggle_simple_mode(self):
+        """Basit mod geçişi"""
+        new_mode = self.simple_mode_var.get()
+        if new_mode != self.simple_mode:
+            # Modu değiştir
+            self.simple_mode = new_mode
+            
+            if self.simple_mode:
+                print("Basit mod etkinleştirildi - YOLO işlemi atlanacak")
+                # Basit modda nesne tespitini devre dışı bırak
+                self.detect_var.set(False)
+            else:
+                print("Tam mod etkinleştirildi - YOLO işlemi etkin olabilir")
+            
+            # Başlık güncelleme
+            self.update_title()
+            
+            # Eğer video oynatılıyorsa, durdur ve yeniden başlat
+            if self.is_playing:
+                was_playing = True
+                self.stop_play_thread()
+            else:
+                was_playing = False
+            
+            # Video oynatılıyorduysa yeniden başlat
+            if was_playing:
+                self.root.after(100, self.toggle_play)
     
     def slider_changed(self, value):
         """İlerleme çubuğu değiştiğinde"""

@@ -1,4 +1,45 @@
 opencv-python==4.8.1.78
 numpy==1.26.2
 ultralytics==8.0.227
-pillow==10.1.0 
+pillow==10.1.0
+import torch  # Torch import
+
+def load_yolo_model(self, model_name):
+    """YOLO modelini yükle"""
+    try:
+        # M1 Mac için MPS (Apple Silicon GPU) kontrolü
+        device = 'cpu'  # Varsayılan olarak CPU
+        if torch.backends.mps.is_available():
+            device = 'mps'
+            print("MPS (Apple Silicon GPU) kullanılıyor.")
+        else:
+            print("MPS kullanılamıyor, CPU kullanılıyor.")
+            
+        # status_label kullanılabilirliğini kontrol et
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text="Model yükleniyor: {} ({})".format(model_name, device))
+            self.root.update()  # UI'yi hemen güncelle
+        
+        # Özel model yolunu kontrol et
+        if model_name in self.custom_models:
+            model_path = os.path.join(self.models_dir, model_name)
+            self.model = YOLO(model_path)
+        else:
+            self.model = YOLO(model_name)
+        
+        # Modeli MPS cihazına taşı
+        self.model.to(device)
+            
+        print("{} modeli başarıyla yüklendi (Cihaz: {}).".format(model_name, device))
+        
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text="{} modeli başarıyla yüklendi (Cihaz: {}).".format(model_name, device))
+            
+    except Exception as e:
+        error_msg = "Model yüklenirken hata oluştu: {}".format(e)
+        print(error_msg)
+        messagebox.showerror("Model Hatası", error_msg)
+        self.model = None
+        
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text="Model yükleme hatası!") 
