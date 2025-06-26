@@ -1,0 +1,17 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Default Ultralytics settings for ByteTrack tracker when using mode="track"
+
+# For ByteTrack source code see https://github.com/ifzhang/ByteTrack
+
+tracker_type: bytetrack # tracker type, ['botsort', 'bytetrack']
+
+track_high_thresh: 0.3 # threshold for the first association (yukarı çekildi - daha güvenli)
+track_low_thresh: 0.15 # threshold for the second association (yukarı çekildi - daha güvenli)
+new_track_thresh: 0.3 # threshold for init new track if the detection does not match any tracks
+track_buffer: 25 # buffer to calculate the time when to remove tracks (küçültüldü)
+match_thresh: 0.8 # threshold for matching tracks
+fuse_score: True # Whether to fuse confidence scores with the iou distances before matching
+
+min_box_area: 10 # threshold for min box areas to filter out tiny boxes
+max_track_per_frame: 50 # maximum number of tracked objects per frame 
