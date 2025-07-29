@@ -374,13 +374,15 @@ CenkerVision, gelişmiş nesne takip ve analiz yeteneklerine sahip bir bilgisaya
         print("DEBUG: check_queue called") # DEBUG
         try:
             if not self.frame_queue.empty():
-                frame, current_frame = self.frame_queue.get_nowait()
-                print(f"DEBUG: Got frame from queue. Type: {type(frame)}, Current Frame No: {current_frame}") # DEBUG
-                if frame is not None:
-                    print(f"DEBUG: Frame from queue shape: {frame.shape if hasattr(frame, 'shape') else 'No shape'}") # DEBUG
+                # Değişiklik: Kuyruktan (frame, results, scale_ratios, current_frame) al
+                original_frame, results, scale_ratios, current_frame = self.frame_queue.get_nowait()
+                print(f"DEBUG: Got from queue. Type: {type(original_frame)}, Results: {'Yes' if results else 'No'}, CF: {current_frame}") # DEBUG
                 
-                if frame is not None and len(frame.shape) == 3:  # Geçerli bir frame mi?
-                    self.update_ui(frame, current_frame)
+                if original_frame is not None and len(original_frame.shape) == 3:  # Geçerli bir frame mi?
+                    # Çizim işlemini burada, ana thread'de yap
+                    h, w = original_frame.shape[:2]
+                    annotated_frame = self.draw_annotations(original_frame, results, scale_ratios, h, w)
+                    self.update_ui(annotated_frame, current_frame)
                 else:
                     print("Geçersiz frame alındı, atlanıyor")
                 
@@ -754,7 +756,8 @@ CenkerVision, gelişmiş nesne takip ve analiz yeteneklerine sahip bir bilgisaya
                     try:
                         print("DEBUG: play_video - Simple mode: Attempting to put frame on queue") # DEBUG
                         frame_to_queue = frame.copy()  # Savunma amaçlı kopya
-                        self.frame_queue.put((frame_to_queue, self.current_frame), block=True, timeout=1)
+                        # Değişiklik: (frame, None, None, current_frame) olarak ekle
+                        self.frame_queue.put((frame_to_queue, None, None, self.current_frame), block=True, timeout=1)
                         print("DEBUG: play_video - Simple mode: Frame put on queue SUCCESS") # DEBUG
                     except queue.Full:
                         print("DEBUG: play_video - Simple mode: Frame queue FULL, frame dropped") # DEBUG
@@ -762,10 +765,11 @@ CenkerVision, gelişmiş nesne takip ve analiz yeteneklerine sahip bir bilgisaya
                     # Frame'i işle ve queue'ya ekle
                     try:
                         print(f"DEBUG: play_video - YOLO mode: Processing frame {self.current_frame}") # DEBUG
-                        processed_frame = self.process_frame(frame)
+                        # Değişiklik: process_frame artık (original_frame, results, scale_ratios) döndürüyor
+                        original_frame, results, scale_ratios = self.process_frame(frame)
                         print(f"DEBUG: play_video - YOLO mode: Frame {self.current_frame} processed. Attempting to put on queue") # DEBUG
-                        frame_to_queue = processed_frame.copy() # Emin olmak için processed_frame'in kopyasını al
-                        self.frame_queue.put((frame_to_queue, self.current_frame), block=True, timeout=1)
+                        # Değişiklik: Kuyruğa (original_frame, results, scale_ratios, current_frame) ekle
+                        self.frame_queue.put((original_frame, results, scale_ratios, self.current_frame), block=True, timeout=1)
                         print(f"DEBUG: play_video - YOLO mode: Processed frame {self.current_frame} put on queue SUCCESS") # DEBUG
                     except queue.Full:
                         print(f"DEBUG: play_video - YOLO mode: Frame queue FULL for frame {self.current_frame}, frame dropped") # DEBUG
@@ -774,8 +778,8 @@ CenkerVision, gelişmiş nesne takip ve analiz yeteneklerine sahip bir bilgisaya
                             print(f"Frame işleme hatası (in play_video): {str(e)}")
                         try:
                             print(f"DEBUG: play_video - YOLO mode: Error processing, attempting to put ORIGINAL frame {self.current_frame} on queue") # DEBUG
-                            original_frame_to_queue = frame.copy()  # Savunma amaçlı kopya
-                            self.frame_queue.put((original_frame_to_queue, self.current_frame), block=True, timeout=1)
+                            # Değişiklik: Hata durumunda da (frame, None, None, current_frame) ekle
+                            self.frame_queue.put((frame.copy(), None, None, self.current_frame), block=True, timeout=1)
                             print(f"DEBUG: play_video - YOLO mode: Original frame {self.current_frame} put on queue after error SUCCESS") # DEBUG
                         except queue.Full:
                             print(f"DEBUG: play_video - YOLO mode: Frame queue FULL for original frame {self.current_frame} after error, frame dropped") # DEBUG
@@ -823,8 +827,121 @@ CenkerVision, gelişmiş nesne takip ve analiz yeteneklerine sahip bir bilgisaya
                 # Hata durumunda kısa bir süre bekleyip devam et
                 time.sleep(0.1)
     
+    def draw_annotations(self, frame, results, scale_ratios, original_h, original_w):
+        """
+        Verilen bir frame üzerine YOLO sonuçlarını (kutular, etiketler) çizer.
+        Ayrıca kitlenme dörtgenini ve sayacını da yönetir.
+        Bu fonksiyon ana UI thread'inde çalıştırılmalıdır.
+        """
+        annotated_frame = frame.copy()
+        scale_ratio_w, scale_ratio_h = (1.0, 1.0) if scale_ratios is None else scale_ratios
+
+        # YOLO sonuçlarını işle ve çiz
+        if results and results[0].boxes is not None:
+            box_count = len(results[0].boxes)
+            
+            # Görüntüleme moduna göre işlem yap
+            if self.display_mode == "normal":
+                try:
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    classes = results[0].boxes.cls.cpu().numpy().astype(int)
+                    conf_values = results[0].boxes.conf.cpu().numpy()
+                    color_palette = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+                    class_names = results[0].names if hasattr(results[0], 'names') else {}
+
+                    for i, box in enumerate(boxes):
+                        x1, y1, x2, y2 = int(box[0] * scale_ratio_w), int(box[1] * scale_ratio_h), int(box[2] * scale_ratio_w), int(box[3] * scale_ratio_h)
+                        cls_id, conf = classes[i], conf_values[i]
+                        label = f"{class_names.get(cls_id, f'Class:{cls_id}')} {conf:.2f}"
+                        color = color_palette[cls_id % len(color_palette)]
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                        cv2.rectangle(annotated_frame, (x1, y1-text_size[1]-5), (x1+text_size[0], y1), color, -1)
+                        cv2.putText(annotated_frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+                        if self.enable_tracking and hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None:
+                            track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+                            id_text = f"ID:{track_ids[i]}"
+                            cv2.putText(annotated_frame, id_text, (x2-50, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                except Exception as plot_error:
+                    print(f"Plot hatası: {plot_error}")
+
+            elif self.display_mode in ("boxes_only", "confidence"):
+                try:
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    if scale_ratio_w != 1.0 or scale_ratio_h != 1.0:
+                        boxes[:, [0, 2]] *= scale_ratio_w
+                        boxes[:, [1, 3]] *= scale_ratio_h
+                    
+                    track_ids = results[0].boxes.id.cpu().numpy().astype(int) if self.enable_tracking and hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None else None
+                    conf_values = results[0].boxes.conf.cpu().numpy() if self.display_mode == "confidence" else None
+
+                    for i, box in enumerate(boxes):
+                        x1, y1, x2, y2 = box.astype(int)
+                        color = self.get_color_for_id(track_ids[i]) if track_ids is not None else (0, 255, 0)
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                        label = ""
+                        if track_ids is not None:
+                            label += f"ID:{track_ids[i]} "
+                        if conf_values is not None:
+                            label += f"{conf_values[i]:.2f}"
+                        if label:
+                            cv2.putText(annotated_frame, label.strip(), (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                except Exception as e:
+                    print(f"Kutu/Conf çizim hatası: {e}")
+
+            elif self.display_mode == "censored":
+                try:
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    if scale_ratio_w != 1.0 or scale_ratio_h != 1.0:
+                        boxes[:, [0, 2]] *= scale_ratio_w
+                        boxes[:, [1, 3]] *= scale_ratio_h
+                    
+                    for box in boxes:
+                        x1, y1, x2, y2 = box.astype(int)
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(annotated_frame.shape[1]-1, x2), min(annotated_frame.shape[0]-1, y2)
+                        if x1 >= x2 or y1 >= y2: continue
+                        roi = annotated_frame[y1:y2, x1:x2]
+                        if roi.size > 0:
+                            blurred_roi = cv2.GaussianBlur(roi, (51, 51), 0)
+                            annotated_frame[y1:y2, x1:x2] = blurred_roi
+                except Exception as blur_error:
+                    print(f"Bulanıklaştırma hatası: {blur_error}")
+        
+        # Kitlenme dörtgeni mantığı
+        lock_left, lock_top = int(original_w * 0.25), int(original_h * 0.10)
+        lock_right, lock_bottom = int(original_w * 0.75), int(original_h * 0.90)
+        cv2.rectangle(annotated_frame, (lock_left, lock_top), (lock_right, lock_bottom), (0, 0, 255), 2)
+        
+        object_in_lock = False
+        if results and results[0].boxes is not None:
+            boxes = results[0].boxes.xyxy.cpu().numpy()
+            if scale_ratio_w != 1.0 or scale_ratio_h != 1.0:
+                boxes[:, [0, 2]] *= scale_ratio_w
+                boxes[:, [1, 3]] *= scale_ratio_h
+            for box in boxes:
+                cx, cy = (box[0] + box[2]) // 2, (box[1] + box[3]) // 2
+                if lock_left <= cx <= lock_right and lock_top <= cy <= lock_bottom:
+                    object_in_lock = True
+                    break
+        
+        now = time.time()
+        if object_in_lock:
+            if self.locked_object_last_time is not None:
+                self.locked_object_timer += now - self.locked_object_last_time
+            self.locked_object_present = True
+            self.locked_object_show_text = f"Süre: {self.locked_object_timer:.1f} sn"
+        else:
+            self.locked_object_timer = 0.0
+            self.locked_object_present = False
+            self.locked_object_show_text = "Obje yok"
+        self.locked_object_last_time = now
+
+        return annotated_frame
+
     def process_frame(self, frame):
-        """Frame işleme"""
+        """Frame işleme: Sadece modeli çalıştırır, sonuçları ve orijinal kareyi döndürür. Çizim yapmaz."""
         # İşlenmemiş kareyi sakla, threshold değiştiğinde kullanmak için
         try:
             original_frame_for_display = frame.copy() # Görüntüleme için orijinal kareyi sakla
@@ -833,6 +950,7 @@ CenkerVision, gelişmiş nesne takip ve analiz yeteneklerine sahip bir bilgisaya
             # Ölçekleme oranlarını başlangıçta 1.0 olarak ayarla (ölçekleme yapılmadığında)
             scale_ratio_w, scale_ratio_h = 1.0, 1.0
             original_h, original_w = frame.shape[:2]
+            results = None
 
             if self.detect_var.get() and self.model is not None:
                 try:
@@ -936,371 +1054,24 @@ CenkerVision, gelişmiş nesne takip ve analiz yeteneklerine sahip bir bilgisaya
                                 print(f"CPU'da YOLO çıkarım süresi: {inference_time*1000:.1f} ms")
                         except Exception as cpu_error:
                             print(f"CPU'da da hata oluştu: {str(cpu_error)}")
-                            # Bu durumda nesne tespitini devre dışı bırak ve orijinal kareyi döndür
+                            # Bu durumda nesne tespitini devre dışı bırak
                             self.detect_var.set(False)
-                            return original_frame_for_display
-                    
-                    # Algılanan nesne/takip sayısını yazdır
-                    if results and results[0].boxes is not None:
-                        box_count = len(results[0].boxes)
-                        
-                        # Takip bilgisi varsa yazdır (ID'ler)
-                        if self.enable_tracking and hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None:
-                            try:
-                                track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-                                if self.debug_mode:
-                                    print(f"Takip edilen nesneler: {len(track_ids)}, ID'ler: {track_ids}")
-                            except Exception as e:
-                                print(f"Takip ID'leri alınırken hata: {str(e)}")
-                                # Hata durumunda takibi devre dışı bırak
-                                self.enable_tracking = False
-                                self.track_var.set(False)
-                        
-                        if self.debug_mode:
-                            print(f"Algılanan nesne sayısı: {box_count}")
-                        
-                        # Görüntüleme moduna göre işlem yap
-                        if self.display_mode == "normal":
-                            # Varsayılan görüntüleme - hem kutular hem class isimleri hem de conf değerleri
-                            try:
-                                # YOLO.plot() metodu ile xyxy değiştiremediğimiz için manuel çizim yapalım
-                                if scale_ratio_w != 1.0 or scale_ratio_h != 1.0:
-                                    # Orijinal görüntüyü kullan
-                                    annotated_frame = original_frame_for_display.copy()
-                                    
-                                    # Kutu koordinatlarını al
-                                    boxes = results[0].boxes.xyxy.cpu().numpy()
-                                    classes = results[0].boxes.cls.cpu().numpy().astype(int)
-                                    conf_values = results[0].boxes.conf.cpu().numpy()
-                                    
-                                    # Kutular için renk paleti
-                                    color_palette = [(255, 0, 0), (0, 255, 0), (0, 0, 255), 
-                                                   (255, 255, 0), (255, 0, 255), (0, 255, 255)]
-                                    
-                                    # Sınıf isimlerini al (varsa)
-                                    class_names = results[0].names if hasattr(results[0], 'names') else {}
-                                    
-                                    # Kutuları ölçeklendir ve çiz
-                                    for i, box in enumerate(boxes):
-                                        # Koordinatları ölçeklendir
-                                        x1 = int(box[0] * scale_ratio_w)
-                                        y1 = int(box[1] * scale_ratio_h)
-                                        x2 = int(box[2] * scale_ratio_w)
-                                        y2 = int(box[3] * scale_ratio_h)
-                                        
-                                        # Sınıf ve güven değeri
-                                        cls_id = classes[i]
-                                        conf = conf_values[i]
-                                        label = ""
-                                        
-                                        # Sınıf adını ekle
-                                        if cls_id in class_names:
-                                            label = f"{class_names[cls_id]} {conf:.2f}"
-                                        else:
-                                            label = f"Class:{cls_id} {conf:.2f}"
-                                        
-                                        # Renk seç
-                                        color = color_palette[cls_id % len(color_palette)]
-                                        
-                                        # Kutuyu çiz
-                                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                                        
-                                        # Metin arka planı
-                                        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
-                                        cv2.rectangle(annotated_frame, (x1, y1-text_size[1]-5), 
-                                                    (x1+text_size[0], y1), color, -1)
-                                        
-                                        # Metni ekle
-                                        cv2.putText(annotated_frame, label, (x1, y1-5),
-                                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                                        
-                                        # Takip ID'sini ekle (varsa)
-                                        if self.enable_tracking and hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None:
-                                            try:
-                                                track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-                                                
-                                                # Takip ID'si yazısını ekle
-                                                id_text = f"ID:{track_ids[i]}"
-                                                # Farklı bir konuma ekle (kutunun sağ üst köşesi)
-                                                cv2.putText(annotated_frame, id_text, (x2-50, y1-5),
-                                                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-                                            except Exception as id_error:
-                                                print(f"Takip ID'sini çizerken hata: {str(id_error)}")
-                                    
-                                    display_frame = annotated_frame
-                                else:
-                                    # Ölçekleme yoksa normal plot metodunu kullan
-                                    annotated_frame = results[0].plot(img=original_frame_for_display.copy())
-                                    display_frame = annotated_frame
-                            except Exception as plot_error:
-                                print(f"Plot hatası: {str(plot_error)}")
-                                display_frame = original_frame_for_display
-                        
-                        elif self.display_mode == "boxes_only":
-                            # Sadece kutuları göster, isimleri ve conf değerlerini gösterme
-                            annotated_frame = original_frame_for_display.copy()
-                            
-                            try:
-                                # Kutu koordinatlarını al ve orijinal boyuta ölçeklendir
-                                boxes = results[0].boxes.xyxy.cpu().numpy()
-                                
-                                if scale_ratio_w != 1.0 or scale_ratio_h != 1.0:
-                                    # Kutuları orijinal boyuta ölçeklendir
-                                    boxes_scaled = boxes.copy()
-                                    boxes_scaled[:, 0] *= scale_ratio_w  # x1
-                                    boxes_scaled[:, 1] *= scale_ratio_h  # y1
-                                    boxes_scaled[:, 2] *= scale_ratio_w  # x2
-                                    boxes_scaled[:, 3] *= scale_ratio_h  # y2
-                                    boxes = boxes_scaled
-                                
-                                # Takip etkinse, takip ID'lerini göster
-                                if self.enable_tracking and hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None:
-                                    try:
-                                        track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-                                        
-                                        for i, box in enumerate(boxes):
-                                            x1, y1, x2, y2 = box.astype(int)
-                                            # Her takip ID'si için farklı renk kullan
-                                            color = self.get_color_for_id(track_ids[i])
-                                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                                            # Takip ID'sini kutu üzerine ekle
-                                            cv2.putText(annotated_frame, f"ID:{track_ids[i]}", (x1, y1-10),
-                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                                    except Exception as id_error:
-                                        print(f"Takip ID'lerini işlerken hata: {str(id_error)}")
-                                        # Hata durumunda takip olmadan devam et
-                                        for box in boxes:
-                                            x1, y1, x2, y2 = box.astype(int)
-                                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                else:
-                                    # Takip yoksa sadece kutuları çiz
-                                    for box in boxes:
-                                        x1, y1, x2, y2 = box.astype(int)
-                                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            except Exception as box_error:
-                                print(f"Kutuları işlerken hata: {str(box_error)}")
-                                # Hata durumunda orijinal kareyi göster
-                            
-                            display_frame = annotated_frame
-                        
-                        elif self.display_mode == "confidence":
-                            # Sadece kutuları ve conf değerlerini göster
-                            annotated_frame = original_frame_for_display.copy()
-                            
-                            try:
-                                # Kutu koordinatlarını al ve orijinal boyuta ölçeklendir
-                                boxes = results[0].boxes.xyxy.cpu().numpy()
-                                conf_values = results[0].boxes.conf.cpu().numpy()
-                                
-                                if scale_ratio_w != 1.0 or scale_ratio_h != 1.0:
-                                    # Kutuları orijinal boyuta ölçeklendir
-                                    boxes_scaled = boxes.copy()
-                                    boxes_scaled[:, 0] *= scale_ratio_w  # x1
-                                    boxes_scaled[:, 1] *= scale_ratio_h  # y1
-                                    boxes_scaled[:, 2] *= scale_ratio_w  # x2
-                                    boxes_scaled[:, 3] *= scale_ratio_h  # y2
-                                    boxes = boxes_scaled
-                                
-                                # Takip etkinse, takip ID'lerini de göster
-                                if self.enable_tracking and hasattr(results[0].boxes, 'id') and results[0].boxes.id is not None:
-                                    try:
-                                        track_ids = results[0].boxes.id.cpu().numpy().astype(int)
-                                        
-                                        for i, box in enumerate(boxes):
-                                            x1, y1, x2, y2 = box.astype(int)
-                                            conf = conf_values[i]
-                                            # Her takip ID'si için farklı renk kullan
-                                            color = self.get_color_for_id(track_ids[i])
-                                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                                            # Takip ID'si ve conf değerini göster
-                                            cv2.putText(annotated_frame, f"ID:{track_ids[i]} {conf:.2f}", (x1, y1-10),
-                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                                    except Exception as id_error:
-                                        print(f"Conf modunda ID'leri işlerken hata: {str(id_error)}")
-                                        # Takip ID'leri alınamazsa conf değeri ile devam et
-                                        for i, box in enumerate(boxes):
-                                            x1, y1, x2, y2 = box.astype(int)
-                                            conf = conf_values[i]
-                                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                            cv2.putText(annotated_frame, "{:.2f}".format(conf), (x1, y1-10),
-                                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                                else:
-                                    # Takip yoksa sadece conf değerlerini göster
-                                    for i, box in enumerate(boxes):
-                                        x1, y1, x2, y2 = box.astype(int)
-                                        conf = conf_values[i]
-                                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                        cv2.putText(annotated_frame, "{:.2f}".format(conf), (x1, y1-10),
-                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                            except Exception as conf_error:
-                                print(f"Confidence değerlerini işlerken hata: {str(conf_error)}")
-                                # Hata durumunda orijinal kareyi göster
-                            
-                            display_frame = annotated_frame
-                        
-                        elif self.display_mode == "censored":
-                            # Tespit edilen nesneleri sansürle/bulanıklaştır
-                            annotated_frame = original_frame_for_display.copy()
-                            
-                            try:
-                                # Kutu koordinatlarını al ve orijinal boyuta ölçeklendir
-                                boxes = results[0].boxes.xyxy.cpu().numpy()
-                                
-                                if scale_ratio_w != 1.0 or scale_ratio_h != 1.0:
-                                    # Kutuları orijinal boyuta ölçeklendir
-                                    boxes_scaled = boxes.copy()
-                                    boxes_scaled[:, 0] *= scale_ratio_w  # x1
-                                    boxes_scaled[:, 1] *= scale_ratio_h  # y1
-                                    boxes_scaled[:, 2] *= scale_ratio_w  # x2
-                                    boxes_scaled[:, 3] *= scale_ratio_h  # y2
-                                    boxes = boxes_scaled
-                                
-                                for box in boxes:
-                                    x1, y1, x2, y2 = box.astype(int)
-                                    # Sınırları çerçeve içinde tut
-                                    h, w = annotated_frame.shape[:2]
-                                    x1, y1 = max(0, x1), max(0, y1)
-                                    x2, y2 = min(w-1, x2), min(h-1, y2)
-                                    
-                                    # Geçerli koordinatlar kontrolü
-                                    if x1 >= x2 or y1 >= y2 or x1 < 0 or y1 < 0 or x2 >= w or y2 >= h:
-                                        continue
-                                        
-                                    # Tespit edilen bölgeyi bulanıklaştır
-                                    roi = annotated_frame[y1:y2, x1:x2]
-                                    if roi.size > 0:  # ROI'nin boş olmadığından emin ol
-                                        blurred_roi = cv2.GaussianBlur(roi, (51, 51), 0)
-                                        annotated_frame[y1:y2, x1:x2] = blurred_roi
-                            except Exception as blur_error:
-                                print(f"Bulanıklaştırma hatası: {str(blur_error)}")
-                                # Hata durumunda orijinal kareyi göster
-                            
-                            display_frame = annotated_frame
-                        
-                        else:
-                            # Bilinmeyen mod, varsayılan görüntülemeyi kullan
-                            try:
-                                # Kutu koordinatlarını düzelt
-                                if scale_ratio_w != 1.0 or scale_ratio_h != 1.0:
-                                    # Manuel çizim yap (plot() metodu yerine)
-                                    annotated_frame = original_frame_for_display.copy()
-                                    
-                                    # Kutu koordinatlarını al
-                                    boxes = results[0].boxes.xyxy.cpu().numpy()
-                                    classes = results[0].boxes.cls.cpu().numpy().astype(int)
-                                    conf_values = results[0].boxes.conf.cpu().numpy()
-                                    
-                                    # Kutular için renk paleti
-                                    color_palette = [(255, 0, 0), (0, 255, 0), (0, 0, 255), 
-                                                   (255, 255, 0), (255, 0, 255), (0, 255, 255)]
-                                    
-                                    # Sınıf isimlerini al (varsa)
-                                    class_names = results[0].names if hasattr(results[0], 'names') else {}
-                                    
-                                    # Kutuları ölçeklendir ve çiz
-                                    for i, box in enumerate(boxes):
-                                        # Koordinatları ölçeklendir
-                                        x1 = int(box[0] * scale_ratio_w)
-                                        y1 = int(box[1] * scale_ratio_h)
-                                        x2 = int(box[2] * scale_ratio_w)
-                                        y2 = int(box[3] * scale_ratio_h)
-                                        
-                                        # Sınıf ve güven değeri
-                                        cls_id = classes[i]
-                                        conf = conf_values[i]
-                                        label = ""
-                                        
-                                        # Sınıf adını ekle
-                                        if cls_id in class_names:
-                                            label = f"{class_names[cls_id]} {conf:.2f}"
-                                        else:
-                                            label = f"Class:{cls_id} {conf:.2f}"
-                                        
-                                        # Renk seç
-                                        color = color_palette[cls_id % len(color_palette)]
-                                        
-                                        # Kutuyu çiz
-                                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                                        
-                                        # Metin arka planı
-                                        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
-                                        cv2.rectangle(annotated_frame, (x1, y1-text_size[1]-5), 
-                                                    (x1+text_size[0], y1), color, -1)
-                                        
-                                        # Metni ekle
-                                        cv2.putText(annotated_frame, label, (x1, y1-5),
-                                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                                        
-                                    display_frame = annotated_frame
-                                else:
-                                    # Ölçekleme yoksa normal plot metodunu kullan
-                                    display_frame = results[0].plot(img=original_frame_for_display.copy())
-                            except Exception as plot_error:
-                                print(f"Varsayılan plot hatası: {str(plot_error)}")
-                                display_frame = original_frame_for_display
+                            # returns original frame below
                 
                 except Exception as e:
                     if str(e):  # Boş hata mesajlarını gösterme
                         print(f"Genel bir hata oluştu: {str(e)}")
-                    # Hata durumunda orijinal görüntüyü göster
-                    display_frame = original_frame_for_display
                     # Eğer sürekli hata alınıyorsa nesne tespitini kapat
                     if hasattr(self, 'detect_var'):
                         print("Nesne tespiti geçici olarak devre dışı bırakılıyor...")
                         self.detect_var.set(False)
-            else:
-                display_frame = original_frame_for_display
-                
-            # Kitlenme dörtgeni koordinatları (örnek: %25 yatay, %10 dikey boşluk)
-            lock_left = int(original_w * 0.25)
-            lock_top = int(original_h * 0.10)
-            lock_right = int(original_w * 0.75)
-            lock_bottom = int(original_h * 0.90)
-
-            # Dörtgeni çiz (kırmızı) - `display_frame` üzerine çizilmeli
-            if display_frame is not None and hasattr(display_frame, 'shape') and len(display_frame.shape) == 3:
-                cv2.rectangle(display_frame, (lock_left, lock_top), (lock_right, lock_bottom), (0, 0, 255), 2)
             
-            # --- Kitlenme dörtgeni sayaç mantığı ---
-            object_in_lock = False
-            # Nesne tespiti açıksa ve kutular varsa
-            if self.detect_var.get() and self.model is not None:
-                try:
-                    results = getattr(self, 'last_results', None)  # Sonuçlar varsa kullan
-                except Exception:
-                    results = None
-                # Son frame'de kutular varsa
-                if 'results' in locals() and results and results[0].boxes is not None:
-                    boxes = results[0].boxes.xyxy.cpu().numpy()
-                    # Her kutu için kontrol et
-                    for box in boxes:
-                        x1, y1, x2, y2 = box.astype(int)
-                        # Kutu, kitlenme dörtgeninin içinde mi? (merkez noktası ile basit kontrol)
-                        cx = (x1 + x2) // 2
-                        cy = (y1 + y2) // 2
-                        if lock_left <= cx <= lock_right and lock_top <= cy <= lock_bottom:
-                            object_in_lock = True
-                            break
-            # Sayaç güncelle
-            now = time.time()
-            if object_in_lock:
-                if self.locked_object_last_time is not None:
-                    self.locked_object_timer += now - self.locked_object_last_time
-                self.locked_object_present = True
-                self.locked_object_show_text = f"Süre: {self.locked_object_timer:.1f} sn"
-            else:
-                self.locked_object_timer = 0.0
-                self.locked_object_present = False
-                self.locked_object_show_text = "Obje yok"
-            self.locked_object_last_time = now
-            # --- sayaç mantığı sonu ---
-
-            return display_frame
+            return original_frame_for_display, results, (scale_ratio_w, scale_ratio_h)
             
         except Exception as e:
-            # En son çare - herhangi bir hata durumunda orijinal frame'i döndür
+            # En son çare - herhangi bir hata durumunda orijinal frame'i ve boş sonuçları döndür
             print(f"Process frame'de kritik hata: {str(e)}")
-            return frame
+            return frame, None, (1.0, 1.0)
     
     def update_ui(self, frame, current_frame):
         """UI elemanlarını güncelle"""
@@ -1399,8 +1170,11 @@ CenkerVision, gelişmiş nesne takip ve analiz yeteneklerine sahip bir bilgisaya
             # Basit modda, direkt frame'i göster
             self.update_ui(frame, self.current_frame)
         else:
-            processed_frame = self.process_frame(frame)
-            self.update_ui(processed_frame, self.current_frame)
+            # Değişiklik: Yeni akışa göre (işle, çiz, göster)
+            original_frame, results, scale_ratios = self.process_frame(frame)
+            h, w = original_frame.shape[:2]
+            annotated_frame = self.draw_annotations(original_frame, results, scale_ratios, h, w)
+            self.update_ui(annotated_frame, self.current_frame)
         
         # Eşik değerlerini durum çubuğunda göster
         if self.detect_var.get() and self.model is not None and not self.simple_mode:
